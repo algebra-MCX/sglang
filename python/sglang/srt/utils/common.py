@@ -4152,6 +4152,10 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # bucket on every EP rank. As for FlashInfer A2A above, this only
             # enables DP-count bookkeeping; expert inputs remain local.
             return True
+        elif moe_a2a_backend.is_nixl():
+            # NIXL EP sizes each forward's dispatch capacity from the DP token
+            # counts, so every EP rank needs the same counts and graph bucket.
+            return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the

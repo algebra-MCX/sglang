@@ -12,7 +12,10 @@ from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -28,6 +31,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
 )
+from sglang.srt.utils import ceil_align
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +377,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
-                self.num_max_dispatch_tokens_per_rank,
+                self._dispatch_capacity(),
                 nixl_num_experts,
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
@@ -385,6 +389,17 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
+
+    def _dispatch_capacity(self) -> int:
+        # Sets the RDMA buffer layout, so all ranks must agree: the DP-synced max,
+        # else the static reservation (TBO sub-batches publish no counts).
+        global_num_tokens = get_dp_global_num_tokens()
+        if global_num_tokens is None:
+            return self.num_max_dispatch_tokens_per_rank
+        return min(
+            ceil_align(max(global_num_tokens), 4),  # NIXL TMA needs a multiple of 4.
+            self.num_max_dispatch_tokens_per_rank,
+        )
 
     def combine_a(
         self,
