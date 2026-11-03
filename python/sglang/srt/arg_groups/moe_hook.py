@@ -707,16 +707,26 @@ def resolve_ascend_ops_speculative_draft(view: Any) -> dict:
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
-    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
-    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
-    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
-    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
+    ceiling = _prefill_ceiling_tokens(server_args)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
         ceiling=ceiling,
-        default_tokens=-(-ceiling // scatter_ranks),
+        default_tokens=_tokens_per_ep_rank(view, ceiling),
     )
+
+
+def _prefill_ceiling_tokens(server_args: Any) -> int:
+    """Largest prefill forward on one DP rank."""
+    view = resolved_view(server_args)
+    return max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+
+
+def _tokens_per_ep_rank(view: Any, tokens_per_dp_rank: int) -> int:
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
+    return -(-tokens_per_dp_rank // scatter_ranks)
 
 
 def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
@@ -769,6 +779,31 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
             f"required={graph_tokens}, capacity={capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
             "the environment value or lower --cuda-graph-max-bs-decode."
+        )
+
+
+def validate_low_latency_prefill_token_budget(server_args: Any) -> None:
+    """Fail fast if a prefill chunk exceeds the DeepEP/NIXL low-latency dispatch
+    capacity; the kernel would assert on the first long prompt. Decode graphs
+    fail at capture, and capture sizes clamp to the memory-derived request pool.
+    """
+    view = resolved_view(server_args)
+    if view.disaggregation_mode == "decode":
+        return
+    if view.moe_a2a_backend == "nixl":
+        capacity_env = envs.SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    elif view.moe_a2a_backend == "deepep" and view.deepep_mode == "low_latency":
+        capacity_env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    else:
+        return
+
+    required = _tokens_per_ep_rank(view, _prefill_ceiling_tokens(server_args))
+    capacity = capacity_env.get()
+    if required > capacity:
+        raise ValueError(
+            f"Low-latency MoE dispatch of a prefill chunk needs required={required} "
+            f"tokens per rank, but {capacity_env.name}={capacity}. Raise it "
+            "(at most 1024) or lower --chunked-prefill-size."
         )
 
 

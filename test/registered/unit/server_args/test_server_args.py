@@ -64,6 +64,7 @@ from sglang.srt.arg_groups.moe_hook import (
     resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
+    validate_low_latency_prefill_token_budget,
 )
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -4184,6 +4185,43 @@ class TestDeepEPv2Args(CustomTestCase):
         args._resolved_overrides = [("test", {"moe_a2a_backend": "deepep"})]
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1):
             validate_deepep_v2_dispatch_token_budget(args)
+
+
+class TestLowLatencyPrefillTokenBudget(CustomTestCase):
+    """A prefill chunk dispatched through DeepEP/NIXL low-latency mode must fit
+    the per-rank capacity; otherwise the first long prompt crashes the server."""
+
+    def _args(self, moe_a2a_backend, **overrides):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend=moe_a2a_backend)
+        server_args._resolved_overrides = []
+        for key, value in overrides.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_deepep_checks_prefill_only_in_low_latency_mode(self):
+        # Auto mode sends prefill through normal dispatch, which has no cap.
+        args = self._args("deepep", chunked_prefill_size=8192)
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_low_latency_prefill_token_budget(args)
+            args.deepep_mode = "low_latency"
+            with self.assertRaisesRegex(ValueError, "required=8192"):
+                validate_low_latency_prefill_token_budget(args)
+
+    def test_nixl_budget_divides_by_scatter_ranks(self):
+        # Pure TP scatters the 2048-token chunk across 16 ranks: 128 per rank.
+        args = self._args("nixl", chunked_prefill_size=2048, tp_size=16)
+        with envs.SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
+            with self.assertRaisesRegex(ValueError, "required=128"):
+                validate_low_latency_prefill_token_budget(args)
+        with envs.SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_low_latency_prefill_token_budget(args)
+
+    def test_decode_instance_skips_prefill_budget(self):
+        args = self._args(
+            "nixl", chunked_prefill_size=8192, disaggregation_mode="decode"
+        )
+        with envs.SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_low_latency_prefill_token_budget(args)
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):
